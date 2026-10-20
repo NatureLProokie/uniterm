@@ -9,6 +9,9 @@ import (
 
 // logPath returns the desktop log location (~/.uniterm/uniterm.log).
 func logPath() string {
+	if overridePath != "" {
+		return overridePath
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "uniterm.log"

@@ -9,9 +9,18 @@ import (
 )
 
 var (
-	mu   sync.Mutex
-	file *os.File
+	mu           sync.Mutex
+	file         *os.File
+	overridePath string
 )
+
+// SetPath redirects the log before Init opens it. The Win7 sidecar points it
+// at its own data dir so it never appends to the installed app's log.
+func SetPath(path string) {
+	mu.Lock()
+	overridePath = path
+	mu.Unlock()
+}
 
 func Init() error {
 	mu.Lock()

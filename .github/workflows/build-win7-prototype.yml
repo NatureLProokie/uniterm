@@ -1,0 +1,47 @@
+name: build-win7-prototype
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [win7-legacy]
+    paths:
+      - 'frontend/**'
+      - 'legacy/win7/**'
+      - '.github/workflows/build-win7-prototype.yml'
+
+jobs:
+  build-prototype:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Install Electron 22 packager
+        working-directory: legacy/win7
+        run: npm install
+      - name: Install Win7 Go toolchain
+        shell: pwsh
+        run: |
+          $version = '1.27.2-1'
+          Invoke-WebRequest -Uri "https://github.com/thongtech/go-legacy-win7/releases/download/v$version/go-legacy-win7-$version.windows_amd64.zip" -OutFile go-win7.zip
+          Expand-Archive go-win7.zip -DestinationPath C:\
+          echo "GO_LEGACY_WIN7=C:\go-legacy-win7" >> $env:GITHUB_ENV
+      - name: Build Go sidecar
+        working-directory: legacy/win7
+        run: npm run build:backend
+      - name: Build Win7 host
+        working-directory: legacy/win7
+        run: npm run pack:win7
+      - uses: actions/upload-artifact@v4
+        with:
+          name: uniterm-win7-prototype
+          path: |
+            legacy/win7/dist/*.exe
+            legacy/win7/dist/*.zip
+          if-no-files-found: error

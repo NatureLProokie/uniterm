@@ -105,3 +105,21 @@ DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM
 OTHER DEALINGS IN THE FONT SOFTWARE.
 ```
+
+## winpty
+
+- **Upstream:** https://github.com/rprichard/winpty
+- **Version / build:** 0.4.3, msvc2015 x64 (`winpty.dll`, `winpty-agent.exe`)
+- **License:** MIT
+- **Bundled in:** `legacy/win7/backend/` and the packaged app's
+  `resources/backend/`. Used only for local terminals on Windows 7/8, where
+  ConPTY is unavailable. The full license text ships alongside the binaries as
+  `winpty-LICENSE.txt`.
+
+## go-winpty
+
+- **Upstream:** https://github.com/iamacarpet/go-winpty
+- **Version:** v1.0.4
+- **License:** Apache License 2.0
+- **Bundled in:** linked into `uniterm-win7-backend.exe` (Go build, not a
+  separate file). Provides the syscall bindings for `winpty.dll`.

@@ -49,6 +49,12 @@ func keychainList(service string) ([]string, error) {
 // syncMetaDir resolves the directory holding sync metadata (sync-config.json
 // and the local snapshot repo clone) via the standard user config dir.
 func syncMetaDir() (string, error) {
+	if metaDirOverride != "" {
+		if err := os.MkdirAll(metaDirOverride, 0o755); err != nil {
+			return "", err
+		}
+		return metaDirOverride, nil
+	}
 	cfgDir, err := os.UserConfigDir()
 	if err != nil {
 		return "", err

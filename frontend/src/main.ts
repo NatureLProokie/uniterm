@@ -10,6 +10,13 @@ import { Window } from '@wailsio/runtime'
 import { useSettingsStore } from './stores/settingsStore'
 import { setLocale } from './i18n'
 
+// The Win7 legacy build is hosted by Electron rather than Wails. The class
+// activates Electron-specific title-bar dragging rules without affecting the
+// regular Wails build.
+if (import.meta.env.MODE === 'win7') {
+  document.documentElement.classList.add('win7-electron')
+}
+
 Window.SetTitle('uniTerm')
 
 // Set ElDialog draggable by default

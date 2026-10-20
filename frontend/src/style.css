@@ -1650,3 +1650,22 @@ button:disabled,
 @media (max-width: 640px) {
   .sql-editor-wrap { min-height: 4rem !important; }
 }
+
+
+/* Electron 22 / Windows 7 compatibility host. Wails converts the
+   --wails-draggable custom property natively; Electron needs Chromium's
+   -webkit-app-region property instead. These rules are dormant in the main
+   Wails build because the root .win7-electron class is only set in Win7 mode. */
+.win7-electron .app-header {
+  -webkit-app-region: drag;
+}
+.win7-electron .app-header button,
+.win7-electron .app-header a,
+.win7-electron .app-header input,
+.win7-electron .app-header select,
+.win7-electron .app-header textarea,
+.win7-electron .app-header [role="button"],
+.win7-electron .app-header .window-controls,
+.win7-electron .app-header .settings-wrap {
+  -webkit-app-region: no-drag;
+}

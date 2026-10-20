@@ -12,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/wailsapp/wails/v3/pkg/services/notifications"
 	"github.com/ys-ll/uniterm/backend/log"
 	"github.com/ys-ll/uniterm/backend/mcp"
 	"github.com/ys-ll/uniterm/backend/session"
@@ -914,46 +913,11 @@ func (a *App) mcpNotifyLanguage() string {
 
 // ── Approval notification (all platforms) ───────────────────────
 
-// notifyMCPApproval surfaces a pending MCP approval through the Wails
-// notifications service when the window is unfocused, and brings the window
-// forward (Focus/Show → Dock bounce on macOS, taskbar attention elsewhere).
-// Platform backends live inside the service: UNUserNotificationCenter on
-// macOS, wintoast on Windows, D-Bus org.freedesktop.Notifications on Linux
-// (requires a running notification daemon). Strings come from
-// mcpNotifyLabels above.
+// notifyMCPApproval used the Wails notification service and raised the
+// window. The Win7 host owns both; the mcp:approval-request event already
+// reaches the UI, so this only leaves a log breadcrumb.
 func (a *App) notifyMCPApproval(req mcp.ApprovalRequest) {
-	if a.notifier == nil {
-		log.Writef("mcp: notification skipped: notifications service unavailable")
-	} else {
-		strs := mcpNotifyStringsFor(a.mcpNotifyLanguage())
-		body := mcpNotifyBody(strs, req.Client, req.Command)
-		// First line: which tab/host the request targets (session title ·
-		// host for exec/file tools, connection name · host for connect).
-		if target := a.mcpConnectionLabel(req.Connection); target != "" {
-			body = target + "\n" + body
-		}
-		// First-run authorization (macOS only; always granted on the other
-		// platforms). Safe to call on every request.
-		if ok, err := a.notifier.CheckNotificationAuthorization(); err == nil && !ok {
-			if _, err := a.notifier.RequestNotificationAuthorization(); err != nil {
-				log.Writef("mcp: notification authorization failed: %v", err)
-			}
-		}
-		if err := a.notifier.SendNotification(notifications.NotificationOptions{
-			ID:    "mcp-approval",
-			Title: strs.Title,
-			Body:  body,
-		}); err != nil {
-			log.Writef("mcp: notification failed: %v", err)
-		}
-	}
-
-	// Bring the window forward so the approval dialog is directly in front
-	// of the user.
-	if a.window != nil {
-		a.window.Focus()
-		a.window.Show()
-	}
+	log.Writef("mcp: approval requested by %s", req.Client)
 }
 
 // Unified async-job bridge: implements mcp.ForegroundJobs over the app's live

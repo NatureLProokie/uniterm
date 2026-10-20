@@ -1,0 +1,19 @@
+{
+  "name": "uniterm-win7-legacy-host",
+  "productName": "uniTerm Win7 Legacy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Windows 7 compatibility host for uniTerm: Electron 22 window + Go sidecar backend.",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "prepare:app": "node scripts/prepare-app.cjs",
+    "build:backend": "node scripts/build-backend.cjs",
+    "start": "npm run prepare:app && electron .",
+    "pack:win7": "npm run prepare:app && electron-builder --win --config electron-builder.win7.yml",
+    "pack:dir": "npm run prepare:app && electron-builder --win dir --config electron-builder.win7.yml"
+  },
+  "devDependencies": {
+    "electron": "22.3.27",
+    "electron-builder": "24.13.3"
+  }
+}

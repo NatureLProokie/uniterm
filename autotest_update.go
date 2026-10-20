@@ -23,9 +23,6 @@ import (
 //	[autotest] PASS: running latest vY
 func (a *App) autotestUpdate() {
 	time.Sleep(4 * time.Second) // let the app + event plumbing settle
-	if a.window != nil {
-		a.window.Hide() // defensive: headless e2e runs must not flash a window
-	}
 
 	log.Writef("[autotest] start, current=%s", Version)
 
@@ -63,5 +60,5 @@ func (a *App) autotestUpdate() {
 	// after run 1 has released the single-instance lock. Spawning first
 	// would make run 2 exit as a "second instance".
 	relaunchPending.Store(true)
-	a.app.Quit()
+	a.quit()
 }

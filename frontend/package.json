@@ -8,7 +8,8 @@
     "build": "vite build",
     "typecheck": "vue-tsc --noEmit",
     "build:dev": "vite build --minify false --mode development",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "build:win7": "vite build --config vite.win7.config.ts --mode win7"
   },
   "dependencies": {
     "@codemirror/commands": "^6.10.4",

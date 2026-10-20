@@ -1,0 +1,32 @@
+appId: net.uniterm.win7legacy
+productName: uniTerm Win7 Legacy
+asar: true
+compression: normal
+# Reuse the already-installed Electron 22 dist; avoids a second download.
+electronDist: node_modules/electron/dist
+directories:
+  output: dist
+extraResources:
+  - from: backend
+    to: backend
+    filter:
+      - uniterm-win7-backend.exe
+      # Windows 7 local terminals: ConPTY is Win10+, winpty bridges the gap.
+      - winpty.dll
+      - winpty-agent.exe
+      - winpty-LICENSE.txt
+files:
+  - electron/**/*
+  - app/**/*
+  - package.json
+  - '!scripts/**/*'
+  - '!backend/**/*'
+win:
+  target:
+    - portable
+    # No-install distribution: the unpacked app (exe + DLLs + resources).
+    - zip
+  artifactName: uniTerm-Win7-${version}-${arch}.${ext}
+  signAndEditExecutable: false
+portable:
+  requestExecutionLevel: user

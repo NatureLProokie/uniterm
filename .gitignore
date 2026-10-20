@@ -89,3 +89,11 @@ build/android/app/src/main/jniLibs/
 build/android/gen/
 build/android/overlay.json
 build/android/local.properties
+
+# Experimental Windows 7 legacy host outputs (kept separate from Wails builds)
+/frontend/dist-win7/
+/legacy/win7/app/
+/legacy/win7/dist/
+/legacy/win7/node_modules/
+/legacy/win7/package-lock.json
+/legacy/win7/backend/uniterm-win7-backend.exe

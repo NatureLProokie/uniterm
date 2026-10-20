@@ -302,6 +302,19 @@ func TestSetDataDir_RejectsDirInsideCurrent(t *testing.T) {
 	}
 }
 
+// TestSetDataDir_RejectsPinnedDir: the Win7 host passes --data-dir on every
+// start, so a change here would revert on restart and write a bootstrap
+// pointer into the Wails build's config dir. It must be refused outright.
+func TestSetDataDir_RejectsPinnedDir(t *testing.T) {
+	a := &App{dataDirPinned: true}
+	if err := a.SetDataDir("custom", t.TempDir(), false); err == nil {
+		t.Fatal("SetDataDir must be refused while the host owns the data dir")
+	}
+	if got := a.dataDirType(); got != "custom" {
+		t.Fatalf("dataDirType while pinned = %q, want custom", got)
+	}
+}
+
 // TestResetCredentialsAllowsFreshSetup is the reset-wedge regression: after a
 // reset, no in-place ciphertext may remain in any manifest-declared file —
 // Setup refuses a data dir that still carries it, which used to leave the

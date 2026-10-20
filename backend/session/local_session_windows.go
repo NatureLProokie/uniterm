@@ -12,12 +12,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/UserExistsError/conpty"
+	winpty "github.com/iamacarpet/go-winpty"
 	"golang.org/x/sys/windows"
 	"golang.org/x/text/encoding"
 	"golang.org/x/text/transform"
@@ -118,7 +120,8 @@ func (s *LocalSession) updateMouseTrackingState(data []byte) {
 type LocalSession struct {
 	baseSession
 	cpty                 *conpty.ConPty
-	admin                *adminPty // elevated shell relayed from the broker process
+	wp                   *winpty.WinPTY // Windows 7 backend (no ConPTY there)
+	admin                *adminPty      // elevated shell relayed from the broker process
 	stdin                io.WriteCloser
 	stdout               io.Reader
 	cmd                  *exec.Cmd
@@ -311,8 +314,9 @@ func (s *LocalSession) Connect(config ConnectionConfig) error {
 		return nil
 	}
 
-	// Try ConPTY first for a real pseudo-terminal experience.
-	if conpty.IsConPtyAvailable() {
+	// Try ConPTY first for a real pseudo-terminal experience. UNITERM_FORCE_WINPTY
+	// exists so the Windows 7 path can be exercised on Windows 10+.
+	if conpty.IsConPtyAvailable() && os.Getenv("UNITERM_FORCE_WINPTY") != "1" {
 		cols, rows := s.GetPendingSize()
 		if cols <= 0 || rows <= 0 {
 			cols, rows = 80, 24
@@ -343,6 +347,35 @@ func (s *LocalSession) Connect(config ConnectionConfig) error {
 			return nil
 		}
 		// Fall through to pipe mode if ConPTY fails.
+	}
+
+	// Windows 7: no ConPTY, so use winpty (bundled next to the sidecar). It
+	// provides the same read/write/resize surface; the pipe fallback below
+	// stays as the last resort when the DLL or agent is missing.
+	{
+		cols, rows := s.GetPendingSize()
+		if cols <= 0 || rows <= 0 {
+			cols, rows = 80, 24
+		}
+		env := cmd.Env
+		if len(env) == 0 {
+			env = os.Environ()
+		}
+		if wp, err := startWinPTY(commandLine, workDir, env, cols, rows); err == nil {
+			s.wp = wp
+			go func() {
+				waitWinPTY(wp)
+				s.Disconnect()
+			}()
+			s.setStatus(StatusConnected)
+			s.startEmitLoop()
+			go s.readLoop()
+			go s.runPostLoginScript(config.PostLoginScript)
+			s.injectStartupCwdHook()
+			return nil
+		} else {
+			log.Writef("winpty unavailable, using pipe fallback: %v", err)
+		}
 	}
 
 	// Pipe fallback using cmd built above.
@@ -527,6 +560,7 @@ func (s *LocalSession) InjectCwdHook() error {
 	go s.watchCwdHookConfirm()
 	return nil
 }
+
 // wslRunCommand runs a one-shot command inside the distro via wsl.exe -e
 // with a timeout, optionally feeding stdin, and returns stdout.
 func wslRunCommand(distro, command, stdin string, timeout time.Duration) (string, error) {
@@ -634,6 +668,11 @@ func (s *LocalSession) SetEncoding(name string) {
 // decoder. Partial trailing multibyte sequences are buffered until the next
 // call. Must only be called from the single readLoop goroutine.
 func (s *LocalSession) decodeOutput(data []byte) []byte {
+	// winpty already converts console output to UTF-8; running the session
+	// decoder on top would mangle non-UTF-8 encodings twice.
+	if s.wp != nil {
+		return data
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.decoder == nil {
@@ -666,6 +705,10 @@ func (s *LocalSession) decodeOutput(data []byte) []byte {
 // encodeInput converts user keystrokes (UTF-8) to the configured encoding
 // before writing to the PTY. Each call handles a complete UTF-8 input.
 func (s *LocalSession) encodeInput(data []byte) []byte {
+	// winpty converts UTF-8 input to the console code page itself.
+	if s.wp != nil {
+		return data
+	}
 	s.mu.RLock()
 	encoder := s.encoder
 	s.mu.RUnlock()
@@ -692,11 +735,13 @@ func (s *LocalSession) readLoop() {
 
 		var n int
 		var err error
-		usingConPty := s.cpty != nil
+		usingConPty := s.cpty != nil || s.wp != nil
 		if s.admin != nil {
 			n, err = s.admin.Read(buf)
-		} else if usingConPty {
+		} else if s.cpty != nil {
 			n, err = s.cpty.Read(buf)
+		} else if s.wp != nil {
+			n, err = s.wp.StdOut.Read(buf)
 		} else {
 			n, err = s.stdout.Read(buf)
 		}
@@ -769,6 +814,8 @@ func (s *LocalSession) Write(data []byte) error {
 		_, err = s.admin.Write(encoded)
 	} else if s.cpty != nil {
 		_, err = s.cpty.Write(encoded)
+	} else if s.wp != nil {
+		_, err = s.wp.StdIn.Write(encoded)
 	} else if s.stdin != nil {
 		_, err = s.stdin.Write(encoded)
 	} else {
@@ -794,6 +841,12 @@ func (s *LocalSession) Disconnect() error {
 			// A closed ConPty returns errors, which those paths handle.
 			s.cpty.Close()
 		}
+		if s.wp != nil {
+			// Terminate first: WinPTY.Close only frees handles, the child
+			// keeps running otherwise.
+			terminateWinPTY(s.wp)
+			s.wp.Close()
+		}
 		if s.stdin != nil {
 			s.stdin.Close()
 		}
@@ -812,6 +865,10 @@ func (s *LocalSession) Resize(cols, rows int) error {
 	}
 	if s.cpty != nil {
 		return s.cpty.Resize(cols, rows)
+	}
+	if s.wp != nil {
+		s.wp.SetSize(uint32(cols), uint32(rows))
+		return nil
 	}
 	// Pipe mode: no resize support.
 	return nil
@@ -835,6 +892,8 @@ func (s *LocalSession) runPostLoginScript(script string) {
 	send := func(data []byte) {
 		if s.cpty != nil {
 			s.cpty.Write(data)
+		} else if s.wp != nil {
+			s.wp.StdIn.Write(data)
 		} else if s.stdin != nil {
 			s.stdin.Write(data)
 		}
@@ -865,4 +924,63 @@ func defaultShell() string {
 		return "bash.exe"
 	}
 	return "cmd.exe"
+}
+
+// winptyDir returns the folder holding winpty.dll / winpty-agent.exe. The
+// sidecar ships them next to its executable; UNITERM_WINPTY_DIR overrides it
+// for tests.
+func winptyDir() string {
+	if dir := os.Getenv("UNITERM_WINPTY_DIR"); dir != "" {
+		return dir
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return filepath.Dir(exe)
+}
+
+// startWinPTY launches commandLine under a hidden Win7-compatible console.
+// AppName must stay empty: winpty passes it straight to CreateProcess as
+// lpApplicationName, so a non-empty value looks for a program by that name
+// instead of parsing Command.
+func startWinPTY(commandLine, workDir string, env []string, cols, rows int) (*winpty.WinPTY, error) {
+	if goruntime.GOARCH != "amd64" {
+		return nil, fmt.Errorf("winpty binaries are amd64-only")
+	}
+	dir := winptyDir()
+	if dir == "" {
+		return nil, fmt.Errorf("cannot locate the executable directory")
+	}
+	for _, name := range []string{"winpty.dll", "winpty-agent.exe"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			return nil, fmt.Errorf("%s missing in %s", name, dir)
+		}
+	}
+	if cols <= 0 {
+		cols = 80
+	}
+	if rows <= 0 {
+		rows = 24
+	}
+	return winpty.OpenWithOptions(winpty.Options{
+		DLLPrefix:   dir,
+		Command:     commandLine,
+		Dir:         workDir,
+		Env:         env,
+		InitialCols: uint32(cols),
+		InitialRows: uint32(rows),
+	})
+}
+
+func waitWinPTY(wp *winpty.WinPTY) {
+	if h := windows.Handle(wp.GetProcHandle()); h != 0 {
+		_, _ = windows.WaitForSingleObject(h, windows.INFINITE)
+	}
+}
+
+func terminateWinPTY(wp *winpty.WinPTY) {
+	if h := windows.Handle(wp.GetProcHandle()); h != 0 {
+		_ = windows.TerminateProcess(h, 1)
+	}
 }

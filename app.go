@@ -8,8 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/wailsapp/wails/v3/pkg/application"
-	"github.com/wailsapp/wails/v3/pkg/services/notifications"
 	"github.com/ys-ll/uniterm/backend/container"
 	"github.com/ys-ll/uniterm/backend/credentials"
 	"github.com/ys-ll/uniterm/backend/importer"
@@ -40,10 +38,19 @@ import (
 )
 
 type App struct {
-	ctx                  context.Context
-	app                  *application.App
-	window               *application.WebviewWindow
-	notifier             *notifications.NotificationService // system notifications (MCP approval prompts)
+	ctx context.Context
+	// eventSink forwards backend events to the host. The Win7 sidecar writes
+	// them to stdout as JSON lines; nil (tests) drops them.
+	eventSink func(name string, data ...any)
+	// updatesDisabled is set by the Win7 sidecar. It ships as part of the
+	// Electron package, and downloading a Wails release would replace the
+	// wrong binary.
+	updatesDisabled bool
+	// dataDirPinned is set when the host passed --data-dir. The host re-passes
+	// the same path on every start, so a change made through SetDataDir could
+	// neither survive a restart nor avoid writing a bootstrap pointer into the
+	// Wails build's config dir.
+	dataDirPinned        bool
 	sessionManager       *session.SessionManager
 	k8sManager           *k8s.Manager
 	containerManager     *container.Manager
@@ -208,20 +215,21 @@ func NewApp(webviewDataPath string) *App {
 // an App without a running Wails runtime), matching the previous
 // `if a.ctx != nil` defensiveness.
 func (a *App) emit(name string, data ...any) {
-	if a.app == nil {
+	if a.eventSink == nil {
 		return
 	}
-	a.app.Event.Emit(name, data...)
+	a.eventSink(name, data...)
 }
 
-// win returns the single application window, used to drive window operations
-// from the v3 application object.
-func (a *App) win() *application.WebviewWindow {
-	return a.window
-}
-
-func (a *App) ServiceStartup(ctx context.Context, options application.ServiceOptions) error {
+// Startup brings the backend up without a GUI. dataDir pins the config
+// directory (the Win7 host passes its own); empty falls back to the normal
+// bootstrap resolution.
+func (a *App) Startup(ctx context.Context, dataDir string) error {
 	a.ctx = ctx
+
+	if dataDir != "" {
+		log.SetPath(filepath.Join(dataDir, "uniterm.log"))
+	}
 
 	a.k8sManager.SetEventEmitter(func(name string, payload any) {
 		a.emit(name, payload)
@@ -235,34 +243,26 @@ func (a *App) ServiceStartup(ctx context.Context, options application.ServiceOpt
 		fmt.Printf("WARN: log.Init failed: %v\n", err)
 	}
 
-	// On macOS, disable the system press-and-hold accent picker for this app so
-	// that holding a key repeats input in the terminal (see app_darwin.go).
-	a.configureMacKeyRepeat()
-
 	a.sessionManager = session.NewSessionManager()
 	a.tunnelService = session.NewTunnelService()
 
-	// Defer EventsEmit from WndProc to avoid blocking the modal resize/move loop.
-	a.moveResizeCh = make(chan string, 10)
-	go func() {
-		for evt := range a.moveResizeCh {
-			a.emit(evt)
-			if evt == "rdp:move-resize-end" {
-				// Notify the frontend that the native window stopped resizing
-				// (drag-to-restore / maximize / programmatic resize). The terminal
-				// re-fits on this signal because the browser does not always fire a
-				// final window.resize at the settled size after a native drag, which
-				// otherwise leaves the canvas at a stale small row count (issue #656).
-				// Platform-neutral name; on non-Windows it simply never fires.
-				a.emit("window:resize-end")
-				a.saveWindowStateFromRuntime()
-			}
+	// The Win7 host pins the data directory so this sidecar never touches the
+	// Wails build's %APPDATA%\uniTerm stores.
+	if dataDir != "" {
+		if err := os.MkdirAll(dataDir, 0o755); err != nil {
+			a.sendStartupErr(fmt.Errorf("data dir: %w", err))
+			a.drainStartupErr()
+			return nil
 		}
-	}()
-
-	// Discover main window HWND for RDP child window embedding
-	a.mainHwnd = a.findMainWindow()
-	a.subclassMainWindow()
+		a.dataDir = dataDir
+		a.dataDirPinned = true
+		// Sync metadata defaults to %APPDATA%\uniTerm, which the Wails build
+		// owns; keep this build's repo inside its own data dir.
+		sync.SetMetaDir(filepath.Join(dataDir, "sync"))
+		a.initStores(dataDir, false)
+		a.drainStartupErr()
+		return nil
+	}
 
 	// Resolve data directory. First run (no bootstrap, no existing config)
 	// defers all store init until the frontend calls SetDataDir.
@@ -369,7 +369,6 @@ func (a *App) initStores(dataDir string, upgrade bool) {
 	a.tunnelService.SetStateCallback(func(st session.TunnelState) {
 		a.emit("tunnel:state", st)
 	})
-	go a.watchForeground(a.ctx)
 
 	// Credential store + auto-unlock / upgrade (wires PasswordStore into
 	// connection + settings stores).
@@ -590,32 +589,6 @@ func (a *App) StartupError() string {
 	return a.startupErr.Error()
 }
 
-// saveWindowStateFromRuntime saves the current window geometry using runtime
-// API calls. Called from the WndProc event loop on Windows (WM_EXITSIZEMOVE).
-func (a *App) saveWindowStateFromRuntime() {
-	if a.localStateStore == nil {
-		return
-	}
-	// Server mode (headless): no window to query.
-	if a.window == nil {
-		return
-	}
-	// Do not save geometry when minimised — the position is off-screen
-	// (-32000, -32000 on Windows) and the size is the tiny taskbar thumbnail,
-	// which would restore incorrectly.
-	if a.win().IsMinimised() {
-		return
-	}
-	ls, err := a.localStateStore.Load()
-	if err != nil {
-		return
-	}
-	ls.WindowX, ls.WindowY = a.window.Position()
-	ls.WindowWidth, ls.WindowHeight = a.window.Size()
-	ls.WindowMaximised = a.window.IsMaximised()
-	_ = a.localStateStore.Save(ls)
-}
-
 func (a *App) SaveWindowState(x, y, width, height int, maximised bool) {
 	if a.localStateStore == nil {
 		return
@@ -630,46 +603,6 @@ func (a *App) SaveWindowState(x, y, width, height int, maximised bool) {
 	ls.WindowHeight = height
 	ls.WindowMaximised = maximised
 	a.localStateStore.Save(ls)
-}
-
-// resetWindowGeometry recovers a lost window (tray menu item): shows it,
-// restores it from maximised, centres it on the PRIMARY screen at the app's
-// standard 1200x800, and persists the new geometry so the next start doesn't
-// restore the lost position. The size is clamped to the primary screen's
-// work area so the taskbar isn't covered.
-func (a *App) resetWindowGeometry() {
-	win := a.win()
-	if win == nil || a.app == nil {
-		return
-	}
-	win.UnMaximise()
-
-	const stdW, stdH = 1200, 800
-	screen := a.app.Screen.GetPrimary()
-	if screen == nil {
-		// Screen API unavailable — at least centre it on the default screen.
-		win.SetSize(stdW, stdH)
-		win.Center()
-	} else {
-		wa := screen.WorkArea
-		w, h := stdW, stdH
-		if w > wa.Width {
-			w = wa.Width
-		}
-		if h > wa.Height {
-			h = wa.Height
-		}
-		win.SetSize(w, h)
-		win.SetPosition(wa.X+(wa.Width-w)/2, wa.Y+(wa.Height-h)/2)
-	}
-
-	// Persist so a restart doesn't resurrect the lost position. Deferred so
-	// the window manager settles the move/resize first.
-	time.AfterFunc(300*time.Millisecond, a.saveWindowStateFromRuntime)
-
-	// The whole point is recovering a lost window — raise it to the
-	// foreground last so the repositioned result is what the user sees.
-	showMainWindow(win)
 }
 
 // IsForeground reports whether the app window is currently in the
@@ -778,32 +711,6 @@ func (a *App) saveConnSnapshot(data session.ConnectionStoreData) {
 	a.lastConnSnapshotMu.Lock()
 	a.lastConnSnapshot = data
 	a.lastConnSnapshotMu.Unlock()
-}
-
-// which don't fire the JS visibilitychange event (Cmd+H on macOS before
-// the WebView is loaded, OS-level Alt+Tab) still update the foreground
-// flag. Runs every 2s — coarse on purpose, this is a lifecycle hint not
-// a hot path. Exits when ctx is done.
-func (a *App) watchForeground(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if a.ctx == nil {
-				continue
-			}
-			if a.window == nil {
-				continue
-			}
-			visible := !a.win().IsMinimised()
-			if visible != a.foreground.Load() {
-				a.SetAppVisibility(visible)
-			}
-		}
-	}
 }
 
 func (a *App) shutdown() {
@@ -1773,9 +1680,7 @@ func (a *App) SaveSettings(settings store.AppSettings) error {
 		a.SetDefaultSessionLogDir(settings.Terminal.SessionLogDir)
 		a.setSessionLogFilename(settings.Terminal.SessionLogFilename)
 		a.triggerAutoSync()
-		// Re-apply the global show/hide hotkey so binding changes (and the
-		// enable switch) take effect immediately. No-op when unchanged.
-		applyGlobalShowHideHotkey(a.app, a.window, trayHotkeyBinding(&settings))
+		// The global show/hide hotkey is the Electron host's job on Win7.
 	}
 	return err
 }
@@ -1919,21 +1824,13 @@ func resolveDialogDir(candidates ...string) string {
 	return home
 }
 
-// openFileDialog builds an open-file picker that starts in a known-good
-// directory. Hidden files are revealed whenever the start directory is itself
-// inside a dot directory (~/.ssh, ~/.kube): the platform panels hide those
-// entries by default, so navigating up to home and back would otherwise leave
-// the target unreachable rather than merely hard to find.
-func (a *App) openFileDialog(title, startDir string) *application.OpenFileDialogStruct {
-	dir := resolveDialogDir(startDir)
-	return a.app.Dialog.OpenFile().
-		SetTitle(title).
-		SetDirectory(dir).
-		ShowHiddenFiles(hasHiddenSegment(dir))
-}
+// errHeadlessDialogs tells the Electron host to answer the call itself. File
+// pickers live in the Electron main process; the sidecar has no GUI.
+var errHeadlessDialogs = errors.New("file dialogs are provided by the Electron host")
 
 // hasHiddenSegment reports whether any path segment starts with a dot, i.e.
-// whether reaching dir again by hand requires hidden files to be visible.
+// whether reaching dir by hand requires hidden files to be visible. Kept for
+// the host-side pickers to mirror.
 func hasHiddenSegment(dir string) bool {
 	for _, seg := range strings.Split(filepath.ToSlash(dir), "/") {
 		if len(seg) > 1 && seg[0] == '.' {
@@ -1946,7 +1843,7 @@ func hasHiddenSegment(dir string) bool {
 // OpenFileDialog opens a single-file picker. startDir is optional and accepts
 // "~"-prefixed paths; it defaults to the home directory.
 func (a *App) OpenFileDialog(startDir ...string) (string, error) {
-	return a.openFileDialog("Select File", firstArg(startDir)).PromptForSingleSelection()
+	return "", errHeadlessDialogs
 }
 
 // firstArg unwraps the optional trailing argument the dialog bindings take, so
@@ -1967,15 +1864,11 @@ func firstArg(args []string) string {
 // The picker starts in ~/.ssh with hidden files shown, since that is where keys
 // live and a dot directory is otherwise unreachable in the panel.
 func (a *App) OpenPrivateKeyFile() (string, error) {
-	path, err := a.openFileDialog("Select Private Key", "~/.ssh").
-		PromptForSingleSelection()
-	if err != nil {
-		return "", err
-	}
-	if path == "" {
-		// Picker cancelled — nothing to import.
-		return "", nil
-	}
+	return "", errHeadlessDialogs
+}
+
+// ReadPrivateKeyFile validates a path chosen by the Electron host's picker.
+func (a *App) ReadPrivateKeyFile(path string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("read private key: %w", err)
@@ -2025,15 +1918,11 @@ func looksLikePrivateKeyPEM(data []byte) bool {
 // Starts in ~/.kube with hidden files shown, for the same reason as the key
 // picker.
 func (a *App) OpenKubeconfigFile() (string, error) {
-	path, err := a.openFileDialog("Select Kubeconfig", "~/.kube").
-		PromptForSingleSelection()
-	if err != nil {
-		return "", err
-	}
-	if path == "" {
-		// Picker cancelled — nothing to import.
-		return "", nil
-	}
+	return "", errHeadlessDialogs
+}
+
+// ReadKubeconfigFile validates a path chosen by the Electron host's picker.
+func (a *App) ReadKubeconfigFile(path string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("read kubeconfig: %w", err)
@@ -2047,46 +1936,25 @@ func (a *App) OpenKubeconfigFile() (string, error) {
 // OpenFileDialogFiltered is like OpenFileDialog but restricts the picker to
 // a single extension filter (e.g. for importing a specific file format).
 func (a *App) OpenFileDialogFiltered(title, filterDisplayName, filterPattern string, startDir ...string) (string, error) {
-	return a.app.Dialog.OpenFileWithOptions(&application.OpenFileDialogOptions{
-		Title:     title,
-		Directory: resolveDialogDir(firstArg(startDir)),
-		Filters: []application.FileFilter{
-			{DisplayName: filterDisplayName, Pattern: filterPattern},
-		},
-	}).PromptForSingleSelection()
+	return "", errHeadlessDialogs
 }
 
 func (a *App) OpenMultipleFilesDialog(startDir ...string) ([]string, error) {
-	return a.openFileDialog("Select Files", firstArg(startDir)).
-		PromptForMultipleSelection()
+	return nil, errHeadlessDialogs
 }
 
 func (a *App) OpenDirectoryDialog(startDir ...string) (string, error) {
-	return a.openFileDialog("Select Directory", firstArg(startDir)).
-		CanChooseDirectories(true).
-		CanChooseFiles(false).
-		PromptForSingleSelection()
+	return "", errHeadlessDialogs
 }
 
 func (a *App) SaveFileDialog(defaultName string, startDir ...string) (string, error) {
-	return a.app.Dialog.SaveFileWithOptions(&application.SaveFileDialogOptions{
-		Title:     "Save File",
-		Filename:  defaultName,
-		Directory: resolveDialogDir(firstArg(startDir)),
-	}).PromptForSingleSelection()
+	return "", errHeadlessDialogs
 }
 
 // SaveFileDialogFiltered is like SaveFileDialog but restricts the picker to
 // a single extension filter (e.g. for exporting a specific file format).
 func (a *App) SaveFileDialogFiltered(title, defaultName, filterDisplayName, filterPattern string, startDir ...string) (string, error) {
-	return a.app.Dialog.SaveFileWithOptions(&application.SaveFileDialogOptions{
-		Title:     title,
-		Filename:  defaultName,
-		Directory: resolveDialogDir(firstArg(startDir)),
-		Filters: []application.FileFilter{
-			{DisplayName: filterDisplayName, Pattern: filterPattern},
-		},
-	}).PromptForSingleSelection()
+	return "", errHeadlessDialogs
 }
 
 func (a *App) GetDesktopPath() (string, error) {
@@ -2132,13 +2000,9 @@ func (a *App) GetAllFonts() ([]platform.FontInfo, error) {
 	return platform.GetAllFonts()
 }
 
-func (a *App) OnConnectionsChanged(callback func(session.ConnectionStoreData)) {
-	a.app.Event.On("store:connections:changed", func(e *application.CustomEvent) {
-		if data, ok := e.Data.(session.ConnectionStoreData); ok {
-			callback(data)
-		}
-	})
-}
+// OnConnectionsChanged is a Wails-only callback bridge. The Win7 host listens
+// to the store:connections:changed event instead; RPC cannot pass functions.
+func (a *App) OnConnectionsChanged(callback func(session.ConnectionStoreData)) {}
 
 type AppInfo struct {
 	Name    string `json:"name"`
@@ -2161,22 +2025,31 @@ func (a *App) GetAppInfo() AppInfo {
 // permission; the successor now focuses itself at startup instead.)
 var relaunchPending atomic.Bool
 
-// RelaunchApp quits the current instance and spawns a fresh one afterwards
-// so settings that are fixed at startup (e.g. the window title bar) can take
-// effect.
+// RelaunchApp asks the host to restart the app: the event fires, then the
+// sidecar exits and Electron spawns a fresh one.
 func (a *App) RelaunchApp() {
-	relaunchPending.Store(true)
-	a.app.Quit()
+	a.emit("app:relaunch")
+	a.quit()
 }
 
 // QuitApp exits the application. The unlock dialog offers it so a user who
 // wants neither to unlock nor to clear credentials is never forced into
 // either choice.
 func (a *App) QuitApp() {
-	a.app.Quit()
+	a.quit()
+}
+
+// quit tears the backend down and exits. The Electron host owns the window,
+// so process exit is the only shutdown signal it needs.
+func (a *App) quit() {
+	a.shutdown()
+	os.Exit(0)
 }
 
 func (a *App) CheckForUpdate(source string) (*update.UpdateInfo, error) {
+	if a.updatesDisabled {
+		return &update.UpdateInfo{Current: Version}, nil
+	}
 	return update.Check(Version, source)
 }
 
@@ -2185,13 +2058,16 @@ var updateManager = update.NewManager()
 
 // emitUpdateProgress forwards update progress payloads to the frontend.
 func (a *App) emitUpdateProgress(p update.Progress) {
-	a.app.Event.Emit("update:progress", p)
+	a.emit("update:progress", p)
 }
 
 // DownloadUpdate downloads and verifies the best available update asset from
 // the ordered candidate list (primary source first, mirror as fallback).
 // Progress is streamed to the frontend via the update:progress event.
 func (a *App) DownloadUpdate(assets []update.UpdateAsset) error {
+	if a.updatesDisabled {
+		return errors.New("updates are managed by the Electron host")
+	}
 	if devBuild {
 		return fmt.Errorf("updates are disabled in development builds")
 	}
@@ -2207,11 +2083,14 @@ func (a *App) DownloadUpdate(assets []update.UpdateAsset) error {
 // NSIS installer after this process exits (the installer relaunches the app),
 // so it just quits instead of relaunching.
 func (a *App) ApplyUpdate() error {
+	if a.updatesDisabled {
+		return errors.New("updates are managed by the Electron host")
+	}
 	if err := updateManager.Apply(a.emitUpdateProgress); err != nil {
 		return err
 	}
 	if update.DetectChannel() == update.ChannelInstaller {
-		a.app.Quit()
+		a.quit()
 		return nil
 	}
 	a.RelaunchApp()
@@ -2291,6 +2170,12 @@ func (a *App) GetDataDirInfo() (DataDirInfo, error) {
 // flag). Returns an error if the target is not writable or, for a non-migrate
 // change into an existing dir, the new dir's credentials cannot be unlocked.
 func (a *App) SetDataDir(kind, customDir string, migrate bool) error {
+	// The Win7 host owns the directory; see dataDirPinned. Without this guard
+	// the change would silently revert on restart and drop bootstrap.json into
+	// the Wails build's %APPDATA%\uniTerm.
+	if a.dataDirPinned {
+		return errors.New("the data directory is managed by the launcher")
+	}
 	target, err := dataDirFor(kind, customDir)
 	if err != nil {
 		return err
@@ -2638,6 +2523,10 @@ func clearSecretsInFile(path, kind string) {
 }
 
 func (a *App) dataDirType() string {
+	// ResolveDataDir reads the Wails build's bootstrap, not --data-dir.
+	if a.dataDirPinned {
+		return "custom"
+	}
 	if dd, err := store.ResolveDataDir(); err == nil {
 		return dd.Type
 	}
